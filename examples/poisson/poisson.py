@@ -23,6 +23,24 @@ import numpy.linalg as la
 from hedge.tools import Reflection, Rotation
 
 
+class ResidualPrinter:
+    def __init__(self, compute_resid=None):
+        self.count = 0
+        self.compute_resid = compute_resid
+
+    def __call__(self, cur_sol):
+        import sys
+
+        if cur_sol is not None:
+            if self.count % 20 == 0:
+                sys.stdout.write("IT %8d %g                 \r" % (
+                    self.count, la.norm(self.compute_resid(cur_sol))))
+        else:
+            sys.stdout.write("IT %8d                    \r" % self.count)
+        self.count += 1
+        sys.stdout.flush()
+
+
 
 
 def main(write_output=True):
@@ -30,6 +48,10 @@ def main(write_output=True):
 
     from hedge.backends import guess_run_context
     rcon = guess_run_context()
+
+    ### flag for cuda enviornment ###
+    from hedge.backends import CUDARunContext as cuda_run_context
+    cuda_run = cuda_run_context is type(rcon)
 
     dim = 2
 
@@ -44,7 +66,8 @@ def main(write_output=True):
     if dim == 2:
         if rcon.is_head_rank:
             from hedge.mesh.generator import make_disk_mesh
-            mesh = make_disk_mesh(r=0.5, boundary_tagger=boundary_tagger,
+            mesh = make_disk_mesh(r=0.5, 
+                    boundary_tagger=boundary_tagger,
                     max_area=1e-2)
     elif dim == 3:
         if rcon.is_head_rank:
@@ -106,12 +129,34 @@ def main(write_output=True):
                 )
         bound_op = op.bind(discr)
 
-        from hedge.iterative import parallel_cg
-        u = -parallel_cg(rcon, -bound_op, 
-                bound_op.prepare_rhs(discr.interpolate_volume_function(rhs_c)), 
-                debug=20, tol=5e-4,
-                dot=discr.nodewise_dot_product,
-                x=discr.volume_zeros())
+        if(cuda_run):
+            from hedge.iterative import parallel_cg
+            u = -parallel_cg(rcon, -bound_op, 
+                    bound_op.prepare_rhs(discr.interpolate_volume_function(rhs_c)), 
+                    debug=20, tol=5e-4,
+                    dot=discr.nodewise_dot_product,
+                    x=discr.volume_zeros())
+        else:
+            rhs = bound_op.prepare_rhs(discr.interpolate_volume_function(rhs_c))
+            def compute_resid(x):
+                return bound_op(x)-rhs
+
+            from scipy.sparse.linalg import minres, LinearOperator
+            u, info = minres(
+                    LinearOperator(
+                        (len(discr), len(discr)),
+                        matvec=bound_op, dtype=bound_op.dtype),
+                    rhs,
+                    callback=ResidualPrinter(compute_resid),
+                    tol=1e-5)
+            print
+            if info != 0:
+                raise RuntimeError("gmres reported error %d" % info)
+            print "finished gmres"
+
+
+        print la.norm(bound_op(u)-rhs)/la.norm(rhs)
+
 
         if write_output:
             from hedge.visualization import SiloVisualizer, VtkVisualizer
